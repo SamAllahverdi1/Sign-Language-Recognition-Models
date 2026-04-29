@@ -4,6 +4,7 @@ from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
+
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -11,22 +12,26 @@ from tqdm import tqdm
 from config import TransformerASLConfig
 from Transformer_ASL import TransformerASL
 
+# google drive paths
 TRAIN_KP = "/content/drive/MyDrive/ASL Translation Project - CS 4641/PhoenixDataset/Phoenix-2014T.train"
 DEV_KP = "/content/drive/MyDrive/ASL Translation Project - CS 4641/PhoenixDataset/Phoenix-2014T.dev"
 TEST_KP = "/content/drive/MyDrive/ASL Translation Project - CS 4641/PhoenixDataset/Phoenix-2014T.test"
 CKPT_DIR = "/content/drive/MyDrive/ASL Translation Project - CS 4641/checkpoints_phoenix"
 
+# global vars
 N_KEYPOINTS = 133 * 3
 MAX_FRAMES = 300
 
-
 def build_phoenix_vocab(train_data: dict) -> tuple[dict, dict]:
     counts = Counter()
+
     for item in train_data.values():
         counts.update(item["gloss"].split())
     vocab = ["<blank>", "<unk>"] + sorted(counts.keys())
+
     gloss_to_idx = {token: idx for idx, token in enumerate(vocab)}
     idx_to_gloss = {idx: token for idx, token in enumerate(vocab)}
+    
     return gloss_to_idx, idx_to_gloss
 
 
@@ -34,10 +39,12 @@ def ctc_greedy_tokens(log_probs: torch.Tensor, blank: int = 0) -> list[int]:
     indices = log_probs.argmax(-1).tolist()
     tokens = []
     prev = None
+
     for idx in indices:
         if idx != prev and idx != blank:
             tokens.append(idx)
         prev = idx
+
     return tokens
 
 
@@ -51,15 +58,19 @@ class PhoenixDataset(Dataset):
         items = list(dict(raw).values())
 
         valid = []
+
         for item in items:
-            n_frames = min(item["keypoint"].shape[0], MAX_FRAMES)
-            n_glosses = len(item["gloss"].split())
-            if n_frames >= max(1, 2 * n_glosses - 1):
+            frames = min(item["keypoint"].shape[0], MAX_FRAMES)
+            glosses = len(item["gloss"].split())
+
+            # drop if too little frames for # glosses
+            if frames >= max(1, 2 * glosses - 1):
                 valid.append(item)
 
         dropped = len(items) - len(valid)
         self.items = valid
         self.gloss_to_idx = gloss_to_idx
+
         print(f"Loaded {len(self.items)} clips ({dropped} dropped - CTC too short)")
 
     def __len__(self):
@@ -78,23 +89,29 @@ class PhoenixDataset(Dataset):
         frames = (frames - frames.mean()) / (frames.std() + 1e-6)
         
         frames = frames[:MAX_FRAMES]
+
         labels = torch.tensor(
             [self.gloss_to_idx.get(token, 1) for token in item["gloss"].split()],
             dtype=torch.long,
         )
+
         return frames, labels
 
 
 def collate_fn(batch):
     frames, labels = zip(*batch)
+
     frame_lengths = torch.tensor([frame.shape[0] for frame in frames], dtype=torch.long)
     frames_padded = pad_sequence(frames, batch_first=True)
+
     label_lengths = torch.tensor([label.shape[0] for label in labels], dtype=torch.long)
     labels_concat = torch.cat(labels)
+
     return frames_padded, frame_lengths, labels_concat, label_lengths
 
-
+# use warm ups, cosine annealing scheduler?
 def build_scheduler(optimizer, max_epochs: int, warmup_epochs: int):
+    # safe warmup size
     warmup_epochs = min(max(warmup_epochs, 0), max_epochs)
     if warmup_epochs == 0:
         return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
@@ -106,7 +123,9 @@ def build_scheduler(optimizer, max_epochs: int, warmup_epochs: int):
         end_factor=1.0,
         total_iters=warmup_epochs,
     )
+
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+    
     return torch.optim.lr_scheduler.SequentialLR(
         optimizer,
         schedulers=[warmup, cosine],

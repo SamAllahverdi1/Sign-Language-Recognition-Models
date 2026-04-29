@@ -15,6 +15,6 @@ class TransformerASLConfig:
 
     d_model: int = 256
     n_layers: int = 6
-    n_heads: int = 8
+    heads: int = 8
     dim_feedforward: int = 1024
     dropout: float = 0.1
