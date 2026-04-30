@@ -6,103 +6,120 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from Transformer_ASL import TransformerASL
-from train_phoenix import DEV_KP, PhoenixDataset, collate_fn, ctc_greedy_tokens, tokens_to_gloss
+from train_phoenix import DEV_KP
+from train_phoenix import PhoenixDataset
+from train_phoenix import collate_phoenix_batch
+from train_phoenix import ctc_greedy_tokens
+from train_phoenix import make_padding_mask
+from train_phoenix import tokens_to_gloss
 
 
-def _edit_distance(a: list, b: list) -> int:
-    m, n = len(a), len(b)
-    dp = list(range(n + 1))
-    for i in range(1, m + 1):
-        prev = dp[0]
-        dp[0] = i
-        for j in range(1, n + 1):
-            current = dp[j]
-            if a[i - 1] == b[j - 1]:
-                dp[j] = prev
-            else:
-                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
-            prev = current
-    return dp[n]
+def edit_distance(reference_words: list, predicted_words: list) -> int:
+    previous_row = list(range(len(predicted_words) + 1))
+
+    for reference_index, reference_word in enumerate(reference_words, start=1):
+        current_row = [reference_index]
+
+        for predicted_index, predicted_word in enumerate(predicted_words, start=1):
+            insert_cost = current_row[predicted_index - 1] + 1
+            delete_cost = previous_row[predicted_index] + 1
+            replace_cost = previous_row[predicted_index - 1]
+
+            if reference_word != predicted_word:
+                replace_cost += 1
+
+            current_row.append(min(insert_cost, delete_cost, replace_cost))
+            
+        previous_row = current_row
+
+    return previous_row[-1]
 
 
-def wer(reference: str, hypothesis: str) -> float:
-    ref = reference.split()
-    hyp = hypothesis.split()
-    if not ref:
-        return 0.0 if not hyp else 1.0
-    return _edit_distance(ref, hyp) / len(ref)
-
-
-def evaluate(ckpt_path: str, batch_size: int = 16):
+def run_phoenix_evaluation(checkpoint_path: str, batch_size: int = 16) -> dict:
+    # cuda yay!
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
     cfg = checkpoint["cfg"]
-    gloss_to_idx = checkpoint["gloss_to_idx"]
-    idx_to_gloss = checkpoint["idx_to_gloss"]
+    gloss_to_index = checkpoint["gloss_to_idx"]
+    index_to_gloss = checkpoint["idx_to_gloss"]
 
     model = TransformerASL(cfg).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
-    dev_ds = PhoenixDataset(DEV_KP, gloss_to_idx)
-    dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
+    dev_dataset = PhoenixDataset(DEV_KP, gloss_to_index)
 
-    total_wer = 0.0
-    total_samples = 0
-    total_inference_time = 0.0
-    sample_idx = 0
+    dev_loader = DataLoader(
+        dev_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_phoenix_batch,
+        num_workers=4,
+    )
+
+    total_word_errors = 0
+    total_reference_words = 0
+    total_clips = 0
+    total_inference_seconds = 0.0
 
     with torch.no_grad():
-        for frames, frame_lens, labels, label_lens in tqdm(dev_loader, desc="Evaluating"):
-            frames = frames.to(device)
-            frame_lens = frame_lens.to(device)
+        for batch in tqdm(dev_loader, desc="Evaluating PHOENIX dev"):
+            (
+                padded_keypoints,
+                keypoint_lengths,
+                gloss_labels,
+                gloss_lengths,
+            ) = batch
 
-            max_len = frames.size(1)
-            padding_mask = torch.arange(max_len, device=device).unsqueeze(0) >= frame_lens.unsqueeze(1)
+            padded_keypoints = padded_keypoints.to(device)
+            keypoint_lengths = keypoint_lengths.to(device)
 
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            start_time = time.perf_counter()
+            padding_mask = make_padding_mask(padded_keypoints, keypoint_lengths)
 
-            # Removed autocast to disable AMP per previous instructions
-            log_probs = model(frames, src_key_padding_mask=padding_mask)
+            start_seconds = time.perf_counter()
+            gloss_log_probs = model(padded_keypoints, src_key_padding_mask=padding_mask)
 
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            end_time = time.perf_counter()
+            end_seconds = time.perf_counter()
+            total_inference_seconds += end_seconds - start_seconds
 
-            total_inference_time += (end_time - start_time)
+            label_start = 0
 
-            label_offset = 0
-            for batch_idx in range(frames.size(0)):
-                seq_len = frame_lens[batch_idx].item()
-                pred_tokens = ctc_greedy_tokens(log_probs[:seq_len, batch_idx, :])
-                hypothesis = tokens_to_gloss(pred_tokens, idx_to_gloss)
+            for batch_index in range(padded_keypoints.size(0)):
+                clip_frame_count = keypoint_lengths[batch_index].item()
+                predicted_tokens = ctc_greedy_tokens(gloss_log_probs[:clip_frame_count, batch_index, :])
+                predicted_gloss = tokens_to_gloss(predicted_tokens, index_to_gloss)
 
-                target_len = label_lens[batch_idx].item()
-                target_tokens = labels[label_offset:label_offset + target_len].tolist()
-                reference = tokens_to_gloss(target_tokens, idx_to_gloss)
-                label_offset += target_len
+                label_count = gloss_lengths[batch_index].item()
+                label_end = label_start + label_count
+                target_tokens = gloss_labels[label_start:label_end].tolist()
+                reference_gloss = tokens_to_gloss(target_tokens, index_to_gloss)
+                label_start = label_end
 
-                total_wer += wer(reference, hypothesis)
-                total_samples += 1
+                reference_words = reference_gloss.split()
+                predicted_words = predicted_gloss.split()
 
-                if sample_idx < 5:
-                    print(f"\n--- Sample {sample_idx + 1} ---")
-                    print(f"REF: {reference}")
-                    print(f"HYP: {hypothesis}")
-                sample_idx += 1
+                total_word_errors += edit_distance(reference_words, predicted_words)
+                total_reference_words += len(reference_words)
+                total_clips += 1
 
-    avg_wer = total_wer / total_samples
-    average_time = total_inference_time / total_samples
-    avg_batch_time = total_inference_time / len(dev_loader)
-    print(f"\nDev samples : {total_samples}")
-    print(f"WER         : {avg_wer:.4f} ({avg_wer * 100:.2f}%)")
-    print(f"Avg Sample Inference Time: {average_time:.4f}s")
-    print(f"Avg Batch Time: {avg_batch_time:.4f}s")
-    return avg_wer
+    word_error_rate = total_word_errors / max(total_reference_words, 1)
+    seconds_per_clip = total_inference_seconds / max(total_clips, 1)
 
+    results = {
+        "device": str(device),
+        "word_error_rate": word_error_rate,
+        "total_inference_seconds": total_inference_seconds,
+        "seconds_per_clip": seconds_per_clip,
+    }
+
+    print(f"Device: {results['device']}")
+    print(f"Word Error Rate: {results['word_error_rate']:.4f} ({results['word_error_rate'] * 100:.2f}%)")
+    print(f"Total Inference Time: {results['total_inference_seconds']:.4f} seconds")
+    print(f"Average Inference Time Per Clip: {results['seconds_per_clip']:.6f} seconds")
+
+    return results
 
 if __name__ == "__main__":
-    evaluate(sys.argv[1])
+    run_phoenix_evaluation(sys.argv[1])

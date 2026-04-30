@@ -11,7 +11,6 @@ class TransformerASLConfig:
     learning_rate: float = 1e-4
     grad_clip: float = 1.0
     weight_decay: float = 0.0
-    warmup_epochs: int = 10
 
     d_model: int = 256
     n_layers: int = 6
